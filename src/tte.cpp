@@ -16,13 +16,15 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include <unistd.h>
-#include <fcntl.h>
-#include <termios.h>
+#include <unistd.h>     // read, write, close
+#include <fcntl.h>      // open
+#include <termios.h>    // tcgetattr, tcsetattr
+#include <sys/stat.h>   // stat, fstat
+#include <sys/ioctl.h>  // ioctl
 
 // Windows alternative to termios.n should be conio.h
 
-#include <stdint.h>
+#include <stdint.h>  // uint*_t and int*_t
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
@@ -45,6 +47,23 @@ typedef int32_t s32;
 typedef int64_t s64;
 
 #define STR(string) (string), (sizeof (string) - 1)
+
+struct Buffer {
+  char *data;
+  size_t used;
+  size_t size;
+};
+
+
+static Buffer
+new_buffer (size_t size)
+{
+  Buffer buffer;
+  buffer.data = (char *) malloc (size);
+  buffer.used = 0;
+  buffer.size = size;
+  return buffer;
+}
 
 enum TextContextType {
   TEXT_CONTEXT_GLOBAL,
@@ -239,33 +258,65 @@ init (char *exec_path)
 }
 
 
-int
-main (int argc, char **argv)
+static termios
+init_screen (void)
 {
-  if (!init (argv[0])) return 1;
-
-  size_t buffer_size = 4096;
-  char *buffer = (char *) malloc (buffer_size);
-  buffer[0] = 0;
-
-  if (argc == 2)
-    {
-      int file = open (argv[1], O_RDONLY);
-      assert (file != -1);
-
-      ssize_t bytes_read = read (file, buffer, buffer_size - 1);
-      buffer[bytes_read] = 0;
-    }
-
+  write (1, STR ("\e7"));       // Save cursor position
+  // write (1, STR ("\e[s"));   // Save cursor position
+  write (1, STR ("\e[?47h"));   // Save screen
   // write (1, STR ("\e[2J"));        // Clear screen
   // write (1, STR ("\e[?25l"));      // Hide cursor
-  // write (1, STR ("\e7"));       // Save cursor position
-  write (1, STR ("\e[?47h"));   // Save screen
-  // write (1, STR ("\e[H"));      // Move cursor to top left
 
-  for (char *buffer_p = parse_space (buffer); *buffer_p; )
+  termios original_terminal_attributes;
+  int tcgetattr_error = tcgetattr (0, &original_terminal_attributes);
+  assert (!tcgetattr_error);
+  termios terminal_attributes = original_terminal_attributes;
+  terminal_attributes.c_lflag &= ~ICANON; // Immediate input
+  terminal_attributes.c_lflag &= ~ECHO;   // Don't echo characters
+  terminal_attributes.c_iflag &= ~IXON;   // Disable ^s and ^q
+  int tcsetattr_error = tcsetattr (0, TCSANOW, &terminal_attributes);
+  assert (!tcsetattr_error);
+
+  return original_terminal_attributes;
+}
+
+
+static void
+destroy_screen (termios original_terminal_attributes)
+{
+  // TODO: Use restore screen to restore colors?
+
+  int tcsetattr_error = tcsetattr (0, TCSADRAIN, &original_terminal_attributes);
+  assert (!tcsetattr_error);
+
+  write (1, STR ("\e[?47l"));   // Restore screen
+  write (1, STR ("\e8"));       // Restore cursor position
+  // write (1, STR ("\e[u"));   // Restore cursor position
+  // write (1, STR ("\e[?25h"));   // Unhide cursor
+}
+
+static Buffer
+load_file (const char *filepath)
+{
+  int fd = open (filepath, O_RDONLY);
+  assert (fd != -1);
+
+  struct stat file_stat;
+  int fstat_error = fstat (fd, &file_stat);
+  assert (!fstat_error);
+
+  Buffer buffer = new_buffer (file_stat.st_size + 1);
+
+  ssize_t bytes_read = read (fd, buffer.data, file_stat.st_size);
+  assert (bytes_read != -1);
+  assert (bytes_read == file_stat.st_size);
+  buffer.data[file_stat.st_size] = 0;
+  buffer.used = file_stat.st_size + 1;
+
+  for (char *buffer_p = parse_space (buffer.data); *buffer_p;)
     {
-      if (buffer_p[0] == '/')
+      char c = buffer_p[0];
+      if (c == '/')
         {
           if (buffer_p[1] == '*')
             {
@@ -284,78 +335,142 @@ main (int argc, char **argv)
               write (1, buffer_p++, 1);
             }
         }
-      else if (buffer_p[0] == '"')
+      else if (c == '"')
         {
           write (1, "\e[1;33m", 7); // bold + green font effect
           write (1, buffer_p++, 1);
           buffer_p = parse_string_literal (buffer_p);
           write (1, "\e[m", 3); // disable font effects
         }
-      else if (buffer_p[0] == '(' || buffer_p[0] == ')' ||
-               buffer_p[0] == '{' || buffer_p[0] == '}' ||
-               buffer_p[0] == '[' || buffer_p[0] == ']' ||
-               buffer_p[0] == '=' ||
-               buffer_p[0] == ',' ||
-               buffer_p[0] == ';' ||
-               buffer_p[0] == '*' ||
-               buffer_p[0] == '&')
+      else if (c == '(' || c == ')' ||
+               c == '{' || c == '}' ||
+               c == '[' || c == ']' ||
+               c == '=' ||
+               c == ',' ||
+               c == ';' ||
+               c == '*' ||
+               c == '&')
         {
           write (1, buffer_p++, 1);
         }
-      else if (is_latin (buffer_p[0]))
+      else if (is_latin (c))
         {
           write (1, "\e[1;34m", 7); // bold + green font effect
           buffer_p = parse_identifier (buffer_p);
           write (1, "\e[m", 3); // disable font effects
         }
-      else if (is_digit (buffer_p[0]))
+      else if (is_digit (c))
         {
           buffer_p = parse_num (buffer_p);
         }
       else
         {
           printf ("\nError: Unable to parse %d ('%c')\n", *buffer_p, *buffer_p);
-          return 1;
         }
 
       buffer_p = parse_space (buffer_p);
     }
 
-  int tcgetattr_error;
-  termios original_terminal_attributes;
-  tcgetattr_error = tcgetattr (0, &original_terminal_attributes);
-  assert (!tcgetattr_error);
-  termios terminal_attributes = original_terminal_attributes;
-  terminal_attributes.c_lflag &= ~ICANON; // Immediate input
-  terminal_attributes.c_lflag &= ~ECHO;   // Don't echo characters
-  terminal_attributes.c_iflag &= ~(IXON | IXOFF);  // Disable ^s and ^q
-  int tcsetattr_error = tcsetattr (0, TCSANOW, &terminal_attributes);
-  assert (!tcsetattr_error);
+  return buffer;
+}
+
+
+int
+main (int argc, char **argv)
+{
+  if (!init (argv[0])) return 1;
+
+  Buffer buffer;
+  if (argc == 2) buffer = load_file (argv[1]);
+  else           buffer = new_buffer (4096);
+
+  termios original_terminal_attributes = init_screen ();
 
   write (1, STR ("\e[H"));      // Move cursor to top left
-  size_t buffer_line_pos = 0;
-  size_t buffer_pos = 0;
+  size_t x = 0;
+  size_t y = 0;
   int keep_running = 1;
+
+  char line_buffer[1024];
+  line_buffer[0] = 0;
 
   while (keep_running)
     {
+      struct winsize window_size;
+      ioctl (STDOUT_FILENO, TIOCGWINSZ, &window_size);
+
+      printf ("\e[%u;1H\e[7m", window_size.ws_row);
+      fflush (stdout);
+      size_t line_buffer_len = strlen (line_buffer);
+      for (int i = line_buffer_len; i < window_size.ws_col; ++i)
+        {
+          line_buffer[i] = '-';
+        }
+      write (1, line_buffer, window_size.ws_col);
+      line_buffer[0] = 0;
+      printf ("\e[0m\e[%lu;%luH", y+1, x+1); fflush (stdout);
+
       char input[64];
       ssize_t bytes_read = read (0, input, 64);
+      assert (bytes_read != -1);
+      sprintf  (line_buffer, "Size: %ux%u; Status: \"",
+                window_size.ws_col,
+                window_size.ws_row);
 
-      printf ("bytes_read: %ld\n", bytes_read);
       for (int i = 0; i < bytes_read; ++i)
         {
-          printf ("key: %d (%c)\n", input[i], input[i]);
+          char numstr[64];
+          if (input[i] >= ' ' && input[i] <= '~')
+            {
+              sprintf (numstr, "%c", input[i]);
+            }
+          else
+            {
+              sprintf (numstr, "\\x%x", input[i]);
+            }
+          strcat (line_buffer, numstr);
         }
+      strcat  (line_buffer, "\"");
 
       if (bytes_read == 1)
         {
-          switch (input[0])
+          char c = input[0];
+
+          if (c >= ' ' && c <= '~')
             {
-            case 1: break;
-            case '\e': {keep_running = 0;} break;
-            case 127: {write (1, STR ("\b \b"));} break;
-            default: {write (1, input, 1);} break;
+              write (1, input, 1);
+              x++;
+              write (1, STR ("\e[C"));
+            }
+          else
+            {
+              switch (c)
+                {
+                case '\n':
+                  {
+                    x = 0;
+                    ++y;
+                    write (1, STR ("\e[C"));
+                    break;
+                  }
+                case 0x7f: // DEL (<backspace>)
+                  {
+                    if (x > 0)
+                      {
+                        --x;
+                        write (1, STR ("\e[D"));
+                        write (1, " ", 1);
+                      }
+                    else if (y > 0)
+                      {
+                        --y;
+                        write (1, STR ("\e[F"));
+                      }
+                    break;
+                  }
+                case 'Q' - '@':
+                case '\e': {keep_running = 0;} break;
+                }
             }
         }
       else if (bytes_read == 3 &&
@@ -366,28 +481,28 @@ main (int argc, char **argv)
             {
             case 'A': // UP
               {
-                if (buffer_pos - buffer_line_pos > 0)
+                if (y - x > 0)
                   {
-                    buffer_pos -= buffer_line_pos + 1;
+                    y -= x + 1;
 
                     size_t line_len = 0;
 
-                    while (buffer_pos > 0 && buffer[buffer_pos - 1] != '\n')
+                    while (y > 0 && buffer.data[y - 1] != '\n')
                       {
                         ++line_len;
-                        --buffer_pos;
+                        --y;
                       }
 
-                    buffer_line_pos =
-                      line_len > buffer_line_pos ? buffer_line_pos : line_len;
+                    x =
+                      line_len > x ? x : line_len;
 
                     write (1, STR ("\e[F"));
 
-                    if (buffer_line_pos > 0)
+                    if (x > 0)
                       {
-                        buffer_pos += buffer_line_pos;
+                        y += x;
                         char line_pos_string[65];
-                        s64_to_str (buffer_line_pos, line_pos_string);
+                        s64_to_str (x, line_pos_string);
                         write (1, STR ("\e["));
                         write (1, line_pos_string, strlen (line_pos_string));
                         write (1, "C", 1);
@@ -396,34 +511,34 @@ main (int argc, char **argv)
               } break;
             case 'B': // DOWN
               {
-                size_t pos = buffer_pos;
-                while (buffer[pos] && buffer[pos] != '\n')
+                size_t pos = y;
+                while (buffer.data[pos] && buffer.data[pos] != '\n')
                   {
                     ++pos;
                   }
 
-                if (buffer[pos])
+                if (buffer.data[pos])
                   {
-                    buffer_pos = pos + 1;
+                    y = pos + 1;
 
                     for (size_t line_pos = 0;
-                         line_pos < buffer_line_pos;
+                         line_pos < x;
                          ++line_pos)
                       {
-                        if (!buffer[buffer_pos] || buffer[buffer_pos] == '\n')
+                        if (!buffer.data[y] || buffer.data[y] == '\n')
                           {
-                            buffer_line_pos = line_pos;
+                            x = line_pos;
                             break;
                           }
-                        ++buffer_pos;
+                        ++y;
                       }
 
                     write (1, STR ("\e[E"));
 
-                    if (buffer_line_pos > 0)
+                    if (x > 0)
                       {
                         char line_pos_string[65];
-                        s64_to_str (buffer_line_pos, line_pos_string);
+                        s64_to_str (x, line_pos_string);
                         write (1, STR ("\e["));
                         write (1, line_pos_string, strlen (line_pos_string));
                         write (1, "C", 1);
@@ -432,38 +547,28 @@ main (int argc, char **argv)
               } break;
             case 'C': // RIGHT
               {
-                if (buffer[buffer_pos] && buffer[buffer_pos] != '\n')
+                // if (buffer.data[y] && buffer.data[y] != '\n')
                   {
-                    buffer_line_pos++;
-                    buffer_pos++;
+                    x++;
+                    // y++;
                     write (1, STR ("\e[C"));
                   }
               } break;
             case 'D': // LEFT
               {
-                if (buffer_line_pos > 0)
+                if (x > 0)
                   {
-                    buffer_line_pos--;
-                    buffer_pos--;
+                    --x;
+                    // --y;
                     write (1, STR ("\e[D"));
                   }
               } break;
             default: assert (!"Unhandled escape key input");
             }
         }
-      else
-        {
-          assert (!"Unhandled key input");
-        }
     }
 
-
-  // tcsetattr_error = tcsetattr (0, TCSADRAIN, &original_terminal_attributes);
-  // assert (!tcsetattr_error);
-
-  // write (1, STR ("\e[?47l"));   // Restore screen
-  // write (1, STR ("\e8"));       // Restore cursor position
-  // write (1, STR ("\e[?25h"));   // Unhide cursor
+  destroy_screen (original_terminal_attributes);
 
   return 0;
 }
