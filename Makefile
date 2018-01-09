@@ -1,5 +1,7 @@
+CFLAGS = -Wall -Wno-unused-function
+
 tte: src/tte.cpp
-	g++ -Wall -o $@ $<
+	g++ $(CFLAGS) -o $@ $<
 
 clean:
 	$(RM) tte
